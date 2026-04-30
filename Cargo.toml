@@ -1,0 +1,12 @@
+[package]
+name = "pqts"
+version = "0.1.0"
+edition = "2021"
+description = "Post-quantum signature schemes: Falcon-512, Dilithium-2, SPHINCS+"
+
+[dependencies]
+sha2 = "0.10"
+sha3 = "0.10"
+rand = "0.8"
+rand_core = "0.6"
+subtle = "2.5"
