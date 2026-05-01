@@ -20,14 +20,11 @@
 //! assert!(verify(&pk, msg, &sig));
 //! ```
 
+pub mod encoding;
 pub mod ntt;
 pub mod params;
 pub mod poly;
 pub mod sampler;
-
-// The sign module contains keygen, sign, and verify implementations.
-// We re-export the public API items for convenience.
-// Note: `mod sign` (type namespace) and `use sign::sign` (value namespace) coexist.
 pub mod sign;
 
 pub use sign::{PublicKey, SecretKey, Signature};

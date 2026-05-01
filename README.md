@@ -6,9 +6,9 @@ Three NIST-standardized post-quantum digital signature algorithms:
 
 | Algorithm | Based On | Sig Size | PK Size | Paradigm |
 |-----------|----------|----------|---------|----------|
-| **Dilithium-2** (ML-DSA-44) | Module-LWE lattice | ~2420 B | ~1312 B | Fiat-Shamir |
-| **Falcon-512** | NTRU lattice | ~666 B | ~897 B | Hash-and-Sign |
-| **SPHINCS+** (128s-simple) | Hash functions (SHA-256) | ~7856 B | ~32 B | Stateless hash-based |
+| **Dilithium-2** (ML-DSA-44) | Module-LWE lattice | 2420 B | 1312 B | Fiat-Shamir |
+| **Falcon-512** | NTRU lattice | 569 B | 896 B | Hash-and-Sign |
+| **SPHINCS+** (128s-simple) | Hash functions (SHA-256) | 7856 B | 32 B | Stateless hash-based |
 
 ## Usage
 

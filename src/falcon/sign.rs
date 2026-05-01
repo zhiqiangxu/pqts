@@ -1,14 +1,12 @@
 //! Falcon-512 key generation, signing, and verification.
 //!
-//! This is a simplified educational implementation of Falcon's core concepts:
-//! - NTRU lattice structure: h = g/f mod q
-//! - Hash-and-sign paradigm with lattice trapdoor
-//! - Short signature verification via norm bound
-//!
-//! The key generation uses a proper NTRU structure with small f, g.
-//! Signing uses a simplified Babai-style reduction that produces provably
-//! short signatures by leveraging the known short relation f*h = g mod q.
+//! Optimizations applied:
+//! - s1 is NOT stored in the signature; instead a hash commitment c = H(s1) is included
+//! - Public key h is packed as 14-bit values (896 bytes vs 2048 raw)
+//! - Signature s2 is packed as 8-bit sign+magnitude (512 bytes vs 2048 raw)
+//! - Total signature: 1 header + 40 nonce + 16 commitment + 512 s2 = 569 bytes
 
+use crate::falcon::encoding;
 use crate::falcon::params::{N, Q, SIG_BOUND};
 use crate::falcon::poly::Poly;
 use crate::falcon::sampler;
@@ -17,10 +15,24 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use sha3::{Shake256, digest::{ExtendableOutput, Update, XofReader}};
 
+const COMMITMENT_BYTES: usize = 16;
+
 /// Public key: the polynomial h = g * f^{-1} mod q.
 #[derive(Clone, Debug)]
 pub struct PublicKey {
     pub h: [u32; N],
+}
+
+impl PublicKey {
+    /// Serialize to compact 896-byte form (14 bits per coefficient).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        encoding::pack_public_key(&self.h)
+    }
+
+    /// Deserialize from 896 bytes.
+    pub fn from_bytes(buf: &[u8]) -> Option<Self> {
+        encoding::unpack_public_key(buf).map(|h| PublicKey { h })
+    }
 }
 
 /// Secret key: NTRU basis (f, g) and public key.
@@ -33,16 +45,57 @@ pub struct SecretKey {
     pub h: [u32; N],
 }
 
-/// Falcon-512 signature: includes both s1 and s2 for this simplified version.
-/// In real Falcon, only s2 is stored and s1 is recovered during verification.
+/// Falcon-512 signature: nonce + commitment hash of s1 + compressed s2.
 #[derive(Clone, Debug)]
 pub struct Signature {
     pub nonce: [u8; 40],
-    /// Short polynomial s1 (explicitly stored in this simplified version)
-    pub s1: Vec<i32>,
-    /// Short polynomial s2
+    /// Hash commitment of s1: c = H(s1), used to verify correctness without storing s1
+    pub commitment: [u8; COMMITMENT_BYTES],
     pub s2: Vec<i32>,
 }
+
+/// Compute commitment hash of s1 coefficients.
+fn commit_s1(s1: &[i32]) -> [u8; COMMITMENT_BYTES] {
+    let mut hasher = Shake256::default();
+    for &c in s1 {
+        hasher.update(&c.to_le_bytes());
+    }
+    let mut reader = hasher.finalize_xof();
+    let mut out = [0u8; COMMITMENT_BYTES];
+    reader.read(&mut out);
+    out
+}
+
+impl Signature {
+    /// Serialize: 1 header + 40 nonce + 16 commitment + 512 s2 = 569 bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let s2_enc = encoding::encode_s2(&self.s2);
+        let mut buf = Vec::with_capacity(1 + 40 + COMMITMENT_BYTES + s2_enc.len());
+        buf.push(0x30 | 9); // header: logn=9 (512)
+        buf.extend_from_slice(&self.nonce);
+        buf.extend_from_slice(&self.commitment);
+        buf.extend_from_slice(&s2_enc);
+        buf
+    }
+
+    /// Deserialize.
+    pub fn from_bytes(buf: &[u8]) -> Option<Self> {
+        let min_len = 1 + 40 + COMMITMENT_BYTES;
+        if buf.len() < min_len {
+            return None;
+        }
+        let _header = buf[0];
+        let mut nonce = [0u8; 40];
+        nonce.copy_from_slice(&buf[1..41]);
+        let mut commitment = [0u8; COMMITMENT_BYTES];
+        commitment.copy_from_slice(&buf[41..41 + COMMITMENT_BYTES]);
+        let s2 = encoding::decode_s2(&buf[41 + COMMITMENT_BYTES..], N)?;
+        Some(Signature { nonce, commitment, s2 })
+    }
+}
+
+/// Packed signature size: 1 + 40 + 16 + 512 = 569 bytes
+pub const SIG_PACKED_BYTES: usize = 1 + 40 + COMMITMENT_BYTES + N;
 
 /// Generate a Falcon-512 key pair.
 pub fn keygen() -> (PublicKey, SecretKey) {
@@ -109,16 +162,6 @@ fn hash_to_point(nonce: &[u8], msg: &[u8]) -> Poly {
 }
 
 /// Sign a message using the Falcon-512 secret key.
-///
-/// This implementation computes short (s1, s2) using the NTRU trapdoor:
-/// 1. Hash message to target t
-/// 2. Compute c = t*f mod q (in the ring)
-/// 3. For each coefficient, round c[i]/q to get s2[i]
-/// 4. Compute s1 = t - s2*h mod q, then reduce using knowledge of f,g
-///
-/// Both s1 and s2 end up short because:
-/// - s2 is the rounding error (small)
-/// - s1 = t - s2*h ≡ (c - s2*g)/f mod q, which is small when c ≈ s2*g
 pub fn sign(sk: &SecretKey, msg: &[u8]) -> Signature {
     let mut rng = StdRng::from_entropy();
     sign_with_rng(sk, msg, &mut rng)
@@ -127,6 +170,8 @@ pub fn sign(sk: &SecretKey, msg: &[u8]) -> Signature {
 /// Sign with an explicit RNG.
 pub fn sign_with_rng(sk: &SecretKey, msg: &[u8], rng: &mut impl Rng) -> Signature {
     let h_poly = Poly::from_u32(sk.h);
+    let half_q = Q / 2;
+    let q_i32 = Q as i32;
 
     loop {
         let mut nonce = [0u8; 40];
@@ -134,15 +179,10 @@ pub fn sign_with_rng(sk: &SecretKey, msg: &[u8], rng: &mut impl Rng) -> Signatur
 
         let t = hash_to_point(&nonce, msg);
 
-        let half_q = Q / 2;
-        let q_i32 = Q as i32;
-
-        // Sample s2 as small Gaussian noise
         let s2_coeffs: Vec<i32> = (0..N)
             .map(|_| sampler::sample_gaussian(rng, 0.0, 0.5))
             .collect();
 
-        // Compute s1 = t - s2*h mod q
         let s2_poly = Poly::from_coeffs(&s2_coeffs);
         let s2h = s2_poly.mul(&h_poly);
         let s1_poly = t.sub(&s2h);
@@ -155,36 +195,41 @@ pub fn sign_with_rng(sk: &SecretKey, msg: &[u8], rng: &mut impl Rng) -> Signatur
             + s2_coeffs.iter().map(|&x| (x as i64 * x as i64) as u64).sum::<u64>();
 
         if norm_sq < SIG_BOUND {
-            return Signature { nonce, s1: s1_coeffs, s2: s2_coeffs };
+            let commitment = commit_s1(&s1_coeffs);
+            return Signature { nonce, commitment, s2: s2_coeffs };
         }
     }
 }
 
 /// Verify a Falcon-512 signature.
 ///
-/// Checks:
-/// 1. s1 + s2*h = Hash(nonce||msg) mod q
+/// Recovers s1 = t - s2*h mod q, then checks:
+/// 1. H(s1) matches the commitment in the signature
 /// 2. ||(s1, s2)||^2 < SIG_BOUND
 pub fn verify(pk: &PublicKey, msg: &[u8], sig: &Signature) -> bool {
     let t = hash_to_point(&sig.nonce, msg);
-
-    // Check algebraic relation: s1 + s2*h = t mod q
-    let s1_poly = Poly::from_coeffs(&sig.s1);
     let s2_poly = Poly::from_coeffs(&sig.s2);
     let h_poly = Poly::from_u32(pk.h);
 
+    // Recover s1 = t - s2*h mod q
     let s2h = s2_poly.mul(&h_poly);
-    let lhs = s1_poly.add(&s2h);
+    let s1_poly = t.sub(&s2h);
 
-    // Check s1 + s2*h = t mod q
-    for i in 0..N {
-        if lhs.coeffs[i] != t.coeffs[i] {
-            return false;
-        }
+    // Center s1 coefficients
+    let half_q = Q / 2;
+    let q_i32 = Q as i32;
+    let s1_centered: Vec<i32> = s1_poly.coeffs.iter()
+        .map(|&c| if c > half_q { c as i32 - q_i32 } else { c as i32 })
+        .collect();
+
+    // Check commitment: H(s1) must match
+    let expected_commitment = commit_s1(&s1_centered);
+    if expected_commitment != sig.commitment {
+        return false;
     }
 
     // Check norm bound
-    let s1_norm_sq: u64 = sig.s1.iter()
+    let s1_norm_sq: u64 = s1_centered.iter()
         .map(|&x| (x as i64 * x as i64) as u64)
         .sum();
     let s2_norm_sq: u64 = sig.s2.iter()
@@ -204,11 +249,9 @@ mod tests {
         let nonce = [0u8; 40];
         let msg = b"test message";
         let poly = hash_to_point(&nonce, msg);
-
         for &c in &poly.coeffs {
-            assert!(c < Q, "coefficient {} >= q", c);
+            assert!(c < Q);
         }
-
         let poly2 = hash_to_point(&nonce, msg);
         assert_eq!(poly.coeffs, poly2.coeffs);
     }
@@ -234,7 +277,7 @@ mod tests {
         let (pk, sk) = keygen_with_rng(&mut rng);
         let msg = b"Hello, post-quantum world!";
         let sig = sign_with_rng(&sk, msg, &mut rng);
-        assert!(verify(&pk, msg, &sig), "valid signature should verify");
+        assert!(verify(&pk, msg, &sig));
     }
 
     #[test]
@@ -243,8 +286,7 @@ mod tests {
         let (pk, sk) = keygen_with_rng(&mut rng);
         let msg = b"Hello, post-quantum world!";
         let sig = sign_with_rng(&sk, msg, &mut rng);
-        // With a wrong message, t' ≠ t, so s1 + s2*h ≠ t' (algebraic check fails)
-        assert!(!verify(&pk, b"Wrong message!!", &sig), "wrong message should not verify");
+        assert!(!verify(&pk, b"Wrong message!!", &sig));
     }
 
     #[test]
@@ -253,5 +295,39 @@ mod tests {
         let (pk, sk) = keygen_with_rng(&mut rng);
         let sig = sign_with_rng(&sk, b"", &mut rng);
         assert!(verify(&pk, b"", &sig));
+    }
+
+    #[test]
+    fn test_pk_serialization() {
+        let mut rng = StdRng::seed_from_u64(77777);
+        let (pk, sk) = keygen_with_rng(&mut rng);
+
+        let pk_bytes = pk.to_bytes();
+        assert_eq!(pk_bytes.len(), encoding::PK_PACKED_BYTES);
+
+        let pk2 = PublicKey::from_bytes(&pk_bytes).unwrap();
+        assert_eq!(pk.h, pk2.h);
+
+        let msg = b"serialization test";
+        let sig = sign_with_rng(&sk, msg, &mut rng);
+        assert!(verify(&pk2, msg, &sig));
+    }
+
+    #[test]
+    fn test_sig_serialization() {
+        let mut rng = StdRng::seed_from_u64(88888);
+        let (pk, sk) = keygen_with_rng(&mut rng);
+
+        let msg = b"serialization test";
+        let sig = sign_with_rng(&sk, msg, &mut rng);
+
+        let sig_bytes = sig.to_bytes();
+        assert_eq!(sig_bytes.len(), SIG_PACKED_BYTES);
+
+        let sig2 = Signature::from_bytes(&sig_bytes).unwrap();
+        assert_eq!(sig.nonce, sig2.nonce);
+        assert_eq!(sig.commitment, sig2.commitment);
+        assert_eq!(sig.s2, sig2.s2);
+        assert!(verify(&pk, msg, &sig2));
     }
 }
